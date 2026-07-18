@@ -135,12 +135,41 @@
   }
 
   function initials(name) {
-    return name
+    const parts = String(name || "")
       .split(/\s+/)
       .filter(Boolean)
       .slice(0, 2)
       .map((p) => p[0].toUpperCase())
       .join("");
+    return parts || "?";
+  }
+
+  function normalizeClient(c) {
+    if (!c || typeof c !== "object" || !c.id) return null;
+    const name = String(c.name || "").trim();
+    if (!name) return null;
+    return {
+      id: String(c.id),
+      name,
+      phone: String(c.phone || "").trim(),
+      email: String(c.email || "").trim(),
+      notes: typeof c.notes === "string" ? c.notes : "",
+    };
+  }
+
+  function normalizeService(s) {
+    if (!s || typeof s !== "object" || !s.id) return null;
+    const name = String(s.name || "").trim();
+    if (!name) return null;
+    const duration = Math.max(5, Math.min(480, Number(s.duration) || 30));
+    const price = Math.max(0, Number(s.price) || 0);
+    return {
+      id: String(s.id),
+      name,
+      duration,
+      price,
+      description: typeof s.description === "string" ? s.description : "",
+    };
   }
 
   function escapeHtml(str) {
@@ -171,8 +200,8 @@
         return null;
       }
       return {
-        clients: data.clients,
-        services: data.services,
+        clients: data.clients.map(normalizeClient).filter(Boolean),
+        services: data.services.map(normalizeService).filter(Boolean),
         appointments: data.appointments.map(normalizeAppointment).filter(Boolean),
       };
     } catch {
@@ -488,16 +517,39 @@
   }
 
   // ─── Modal helpers ───────────────────────────────────────────────────────
+  const FOCUSABLE_SEL =
+    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+  function getFocusable(container) {
+    return [...container.querySelectorAll(FOCUSABLE_SEL)].filter((el) => {
+      if (el.hasAttribute("disabled") || el.getAttribute("aria-hidden") === "true") return false;
+      const style = window.getComputedStyle(el);
+      if (style.visibility === "hidden" || style.display === "none") return false;
+      return el.getClientRects().length > 0;
+    });
+  }
+
   function openModal(id) {
-    ui.lastFocused = document.activeElement;
     const modal = document.getElementById(id);
+    if (!modal) return;
+
+    // Confirmação empilha sobre o modal atual; demais modais substituem o anterior
+    if (id !== "confirm-modal") {
+      document.querySelectorAll(".modal-backdrop").forEach((m) => {
+        if (m.id === id) return;
+        if (m.id === "confirm-modal") ui.confirmCallback = null;
+        m.hidden = true;
+      });
+      ui.lastFocused = document.activeElement;
+    } else if (!ui.openModal) {
+      ui.lastFocused = document.activeElement;
+    }
+
     modal.hidden = false;
     document.body.classList.add("modal-open");
     ui.openModal = id;
-    const focusable = modal.querySelector(
-      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
-    );
-    if (focusable) focusable.focus();
+    const focusable = getFocusable(modal);
+    if (focusable[0]) focusable[0].focus();
   }
 
   function closeModal(id) {
@@ -514,6 +566,8 @@
     if (stillOpen) {
       ui.openModal = stillOpen.id;
       document.body.classList.add("modal-open");
+      const focusable = getFocusable(stillOpen);
+      if (focusable[0]) focusable[0].focus();
     } else {
       document.body.classList.remove("modal-open");
       if (ui.lastFocused && typeof ui.lastFocused.focus === "function") {
@@ -526,12 +580,27 @@
     }
   }
 
-  function closeAllModals() {
-    document.querySelectorAll(".modal-backdrop").forEach((m) => {
-      m.hidden = true;
-    });
-    ui.openModal = null;
-    document.body.classList.remove("modal-open");
+  function trapFocus(e) {
+    if (e.key !== "Tab" || !ui.openModal) return;
+    const modal = document.getElementById(ui.openModal);
+    if (!modal || modal.hidden) return;
+    const nodes = getFocusable(modal);
+    if (!nodes.length) {
+      e.preventDefault();
+      return;
+    }
+    const first = nodes[0];
+    const last = nodes[nodes.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    } else if (!modal.contains(document.activeElement)) {
+      e.preventDefault();
+      first.focus();
+    }
   }
 
   function confirmDialog(title, message, onConfirm, dangerLabel = "Confirmar") {
@@ -819,18 +888,59 @@
       }
     }
 
-    const blocks = appts
+    // Layout em colunas quando horários se sobrepõem (inclui cancelados no dia)
+    const layout = appts
       .map((a) => {
         const s = apptStart(a);
         const startMin = s.getHours() * 60 + s.getMinutes();
         const top = ((startMin - dayStartMin) / 60) * hourH;
         const height = Math.max((a.duration / 60) * hourH, 32);
-        if (top + height < 0 || top > totalH) return "";
+        return {
+          a,
+          s,
+          top,
+          height,
+          startMs: s.getTime(),
+          endMs: apptEnd(a).getTime(),
+          col: 0,
+          cols: 1,
+        };
+      })
+      .filter((x) => x.top + x.height >= 0 && x.top <= totalH)
+      .sort((x, y) => x.startMs - y.startMs || y.endMs - x.endMs);
+
+    layout.forEach((item, i) => {
+      const used = new Set();
+      for (let j = 0; j < i; j++) {
+        const other = layout[j];
+        if (item.startMs < other.endMs && other.startMs < item.endMs) {
+          used.add(other.col);
+        }
+      }
+      let col = 0;
+      while (used.has(col)) col++;
+      item.col = col;
+    });
+    layout.forEach((item) => {
+      let maxCol = item.col;
+      layout.forEach((other) => {
+        if (item.startMs < other.endMs && other.startMs < item.endMs) {
+          maxCol = Math.max(maxCol, other.col);
+        }
+      });
+      item.cols = maxCol + 1;
+    });
+
+    const blocks = layout
+      .map((item) => {
+        const { a, s, top, height, col, cols } = item;
+        const widthPct = 100 / cols;
+        const leftPct = col * widthPct;
         const client = getClient(a.clientId);
         const service = getService(a.serviceId);
         return `
           <button type="button" class="appt-block status-${a.status}" data-actions="${a.id}"
-            style="top:${Math.max(0, top)}px;height:${height}px;position:absolute"
+            style="top:${Math.max(0, top)}px;height:${height}px;left:calc(${leftPct}% + 2px);width:calc(${widthPct}% - 4px);right:auto;position:absolute"
             aria-label="${escapeHtml(client?.name || "")} às ${formatTime(s)}, ${STATUS[a.status]?.label || a.status}">
             <strong>${escapeHtml(client?.name || "—")}</strong>
             <span class="appt-sub">${formatTime(s)}–${formatTime(apptEnd(a))} · ${escapeHtml(service?.name || "")}</span>
@@ -843,7 +953,7 @@
         <h2>${formatDateBR(day)}</h2>
         <span class="badge badge-confirmado">${appts.filter((a) => a.status !== "cancelado").length} na agenda</span>
       </div>
-      <div class="day-timeline" role="list" aria-label="Horários do dia">
+      <div class="day-timeline" aria-label="Horários do dia">
         <div class="day-timeline-inner" style="position:relative;display:grid;grid-template-columns:56px 1fr;min-height:${totalH}px">
           <div class="day-hours" aria-hidden="true">
             ${hours
@@ -1180,6 +1290,9 @@
     if (!duration || duration < 5) {
       setFieldError("service-duration", "Duração mínima de 5 minutos.");
       ok = false;
+    } else if (duration > 480) {
+      setFieldError("service-duration", "Duração máxima de 480 minutos.");
+      ok = false;
     }
     if (Number.isNaN(price) || price < 0) {
       setFieldError("service-price", "Informe um preço válido.");
@@ -1187,17 +1300,20 @@
     }
     if (!ok) return;
 
+    const safeDuration = Math.max(5, Math.min(480, Math.round(duration)));
+    const safePrice = Math.max(0, price);
+
     if (id) {
       const s = getService(id);
       if (s) {
         s.name = name;
-        s.duration = duration;
-        s.price = price;
+        s.duration = safeDuration;
+        s.price = safePrice;
         s.description = description;
       }
       toast("Serviço atualizado.", "success");
     } else {
-      state.services.push({ id: uid(), name, duration, price, description });
+      state.services.push({ id: uid(), name, duration: safeDuration, price: safePrice, description });
       toast("Serviço cadastrado.", "success");
     }
     saveState();
@@ -1273,13 +1389,32 @@
       document.getElementById("appt-notes").value = appt.notes || "";
     } else {
       const d = presets.date || ui.agendaDate;
+      let duration = 30;
+      let price = 0;
+      const presetServiceId = presets.serviceId || "";
+      if (presetServiceId) {
+        const svc = getService(presetServiceId);
+        if (svc) {
+          duration = svc.duration;
+          price = svc.price;
+        }
+      }
       document.getElementById("appt-date").value = toDateInput(d);
-      document.getElementById("appt-time").value = presets.time || "09:00";
-      document.getElementById("appt-duration").value = 30;
-      document.getElementById("appt-price").value = 0;
+      document.getElementById("appt-duration").value = duration;
+      document.getElementById("appt-price").value = price;
       document.getElementById("appt-status").value = "agendado";
       document.getElementById("appt-notes").value = "";
-      // apply service defaults if selected later
+
+      // Preferir horário livre: evita abrir o formulário já bloqueado por conflito
+      if (presets.time) {
+        document.getElementById("appt-time").value = presets.time;
+      } else {
+        const preferred = parseDateTime(toDateInput(d), "09:00");
+        const free = suggestFreeSlots(preferred, duration, null, 1);
+        const slot = free[0] || preferred;
+        document.getElementById("appt-date").value = toDateInput(slot);
+        document.getElementById("appt-time").value = formatTime(slot);
+      }
     }
 
     if (presets.reschedule) {
@@ -1415,6 +1550,8 @@
     }
     if (!ok) return;
 
+    const safeDuration = Math.max(5, Math.min(480, duration));
+    const safePrice = Math.max(0, price);
     const start = parseDateTime(date, time);
     if (Number.isNaN(start.getTime())) {
       setFieldError("appt-date", "Data ou horário inválidos.");
@@ -1423,9 +1560,9 @@
 
     // Revalida conflito no submit (mesmo se o botão foi reabilitado via DOM)
     if (ACTIVE_STATUSES.includes(status)) {
-      const conflicts = findConflicts(start, duration, id || null);
+      const conflicts = findConflicts(start, safeDuration, id || null);
       if (conflicts.length) {
-        showConflict(conflicts, start, duration, id || null);
+        showConflict(conflicts, start, safeDuration, id || null);
         toast("Não é possível salvar: há conflito de horário.", "error");
         return;
       }
@@ -1442,8 +1579,8 @@
       a.clientId = clientId;
       a.serviceId = serviceId;
       a.start = start.toISOString();
-      a.duration = duration;
-      a.price = price;
+      a.duration = safeDuration;
+      a.price = safePrice;
       a.status = status;
       a.notes = notes;
       toast("Agendamento atualizado.", "success");
@@ -1453,8 +1590,8 @@
         clientId,
         serviceId,
         start: start.toISOString(),
-        duration,
-        price,
+        duration: safeDuration,
+        price: safePrice,
         status,
         notes,
         createdAt: new Date().toISOString(),
@@ -1704,11 +1841,19 @@
       });
     });
 
-    // Escape
+    // Escape, focus trap e fechamento do menu mobile
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && ui.openModal) {
-        closeModal(ui.openModal);
+      if (e.key === "Escape") {
+        if (ui.openModal) {
+          closeModal(ui.openModal);
+          return;
+        }
+        if (document.getElementById("sidebar").classList.contains("open")) {
+          closeSidebar();
+        }
+        return;
       }
+      trapFocus(e);
     });
 
     // Agenda controls
